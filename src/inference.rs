@@ -21,9 +21,9 @@ pub(crate) const S_MIN: f32 = 0.01;
 pub type Parameters = [f32];
 use itertools::izip;
 
-pub static DEFAULT_PARAMETERS: [f32; 17] = [
-    0.4872, 1.4003, 3.7145, 13.8206, 5.1618, 1.2298, 0.8975, 0.031, 1.6474, 0.1367, 1.0461, 2.1072,
-    0.0793, 0.3246, 1.587, 0.2272, 2.8755,
+pub static DEFAULT_PARAMETERS: [f32; 19] = [
+    0.4072, 1.1829, 3.1262, 15.4722, 7.2102, 0.5316, 1.0651, 0.0234, 1.616, 0.1544, 1.0824, 1.9813,
+    0.0953, 0.2975, 2.2042, 0.2407, 2.9466, 0.5034, 0.6567,
 ];
 
 fn infer<B: Backend>(
@@ -117,7 +117,8 @@ impl<B: Backend> FSRS<B> {
         interval: f32,
         sm2_retention: f32,
     ) -> Result<MemoryState> {
-        let stability = interval.max(S_MIN) / (9.0 * (1.0 / sm2_retention - 1.0));
+        let stability =
+            interval.max(S_MIN) * FACTOR as f32 / (sm2_retention.powf(1.0 / DECAY as f32) - 1.0);
         let w = &self.model().w;
         let w8: f32 = w.get(8).into_scalar().elem();
         let w9: f32 = w.get(9).into_scalar().elem();
@@ -171,25 +172,20 @@ impl<B: Backend> FSRS<B> {
         let current_memory_state_tensors = current_memory_state.map(MemoryStateTensors::from);
         let model = self.model();
         let mut next_memory_states = (1..=4).map(|rating| {
-            Ok(
-                if let (Some(current_memory_state), 0) = (current_memory_state, days_elapsed) {
-                    // When there's an existing memory state and no days have elapsed, we leave it unchanged.
-                    current_memory_state
-                } else {
-                    let state = MemoryState::from(model.step(
-                        delta_t.clone(),
-                        Tensor::from_data(
-                            Data::new(vec![rating.elem()], Shape { dims: [1] }),
-                            &self.device(),
-                        ),
-                        current_memory_state_tensors.clone(),
-                    ));
-                    if !state.stability.is_finite() || !state.difficulty.is_finite() {
-                        return Err(FSRSError::InvalidInput);
-                    }
-                    state
-                },
-            )
+            Ok({
+                let state = MemoryState::from(model.step(
+                    delta_t.clone(),
+                    Tensor::from_data(
+                        Data::new(vec![rating.elem()], Shape { dims: [1] }),
+                        &self.device(),
+                    ),
+                    current_memory_state_tensors.clone(),
+                ));
+                if !state.stability.is_finite() || !state.difficulty.is_finite() {
+                    return Err(FSRSError::InvalidInput);
+                }
+                state
+            })
         });
 
         let mut get_next_state = || {
@@ -266,7 +262,7 @@ impl<B: Backend> FSRS<B> {
     /// How well the user is likely to remember the item after `days_elapsed` since the previous
     /// review.
     pub fn current_retrievability(&self, state: MemoryState, days_elapsed: u32) -> f32 {
-        (days_elapsed as f32 / (state.stability * 9.0) + 1.0).powi(-1)
+        (days_elapsed as f64 / state.stability as f64 * FACTOR + 1.0).powf(DECAY) as f32
     }
 
     /// Returns the universal metrics for the existing and provided parameters. If the first value
@@ -381,10 +377,29 @@ mod tests {
     };
 
     static PARAMETERS: &[f32] = &[
-        1.0171, 1.8296, 4.4145, 10.9355, 5.0965, 1.3322, 1.017, 0.0, 1.6243, 0.1369, 1.0321,
-        2.1866, 0.0661, 0.336, 1.7766, 0.1693, 2.9244,
+        0.6845422,
+        1.6790825,
+        4.7349424,
+        10.042885,
+        7.4410233,
+        0.64219797,
+        1.071918,
+        0.0025195254,
+        1.432437,
+        0.1544,
+        0.8692766,
+        2.0696752,
+        0.0953,
+        0.2975,
+        2.4691248,
+        0.19542035,
+        3.201072,
+        0.18046261,
+        0.121442534,
     ];
-
+    fn assert_approx_eq(a: [f32; 2], b: [f32; 2]) {
+        Data::from(a).assert_approx_eq(&Data::from(b), 5);
+    }
     #[test]
     fn test_get_bin() {
         let pred = (0..=100).map(|i| i as f32 / 100.0).collect::<Vec<_>>();
@@ -430,8 +445,8 @@ mod tests {
         assert_eq!(
             fsrs.memory_state(item, None).unwrap(),
             MemoryState {
-                stability: 43.05542,
-                difficulty: 7.7609
+                stability: 31.722975,
+                difficulty: 7.382128
             }
         );
 
@@ -448,8 +463,8 @@ mod tests {
             .good
             .memory,
             MemoryState {
-                stability: 51.441338,
-                difficulty: 7.005062
+                stability: 40.874535,
+                difficulty: 6.9913807
             }
         );
         Ok(())
@@ -468,29 +483,36 @@ mod tests {
     #[test]
     fn test_evaluate() -> Result<()> {
         let items = anki21_sample_file_converted_to_fsrs();
-        let (mut pretrainset, mut trainset): (Vec<FSRSItem>, Vec<FSRSItem>) =
-            items.into_iter().partition(|item| item.reviews.len() == 2);
+        let (mut pretrainset, mut trainset): (Vec<FSRSItem>, Vec<FSRSItem>) = items
+            .into_iter()
+            .partition(|item| item.long_term_review_cnt() == 1);
         (pretrainset, trainset) = filter_outlier(pretrainset, trainset);
         let items = [pretrainset, trainset].concat();
-        let fsrs = FSRS::new(Some(&[]))?;
 
+        let fsrs = FSRS::new(Some(&[
+            0.669, 1.679, 4.1355, 9.862, 7.9435, 0.9379, 1.0148, 0.1588, 1.3851, 0.1248, 0.8421,
+            1.992, 0.153, 0.284, 2.4282, 0.2547, 3.1847, 0.2196, 0.1906,
+        ]))?;
         let metrics = fsrs.evaluate(items.clone(), |_| true).unwrap();
 
-        Data::from([metrics.log_loss, metrics.rmse_bins])
-            .assert_approx_eq(&Data::from([0.204_330, 0.031_510]), 5);
+        assert_approx_eq([metrics.log_loss, metrics.rmse_bins], [0.210983, 0.037216]);
+
+        let fsrs = FSRS::new(Some(&[]))?;
+        let metrics = fsrs.evaluate(items.clone(), |_| true).unwrap();
+
+        assert_approx_eq([metrics.log_loss, metrics.rmse_bins], [0.217689, 0.039710]);
 
         let fsrs = FSRS::new(Some(PARAMETERS))?;
         let metrics = fsrs.evaluate(items.clone(), |_| true).unwrap();
 
-        Data::from([metrics.log_loss, metrics.rmse_bins])
-            .assert_approx_eq(&Data::from([0.202_188, 0.021_781]), 5);
+        assert_approx_eq([metrics.log_loss, metrics.rmse_bins], [0.203235, 0.026295]);
 
         let (self_by_other, other_by_self) = fsrs
-            .universal_metrics(items, &DEFAULT_PARAMETERS, |_| true)
+            .universal_metrics(items.clone(), &DEFAULT_PARAMETERS, |_| true)
             .unwrap();
 
-        Data::from([self_by_other, other_by_self])
-            .assert_approx_eq(&Data::from([0.013_520, 0.019_003]), 5);
+        assert_approx_eq([self_by_other, other_by_self], [0.014476, 0.031874]);
+
         Ok(())
     }
 
@@ -523,31 +545,31 @@ mod tests {
             NextStates {
                 again: ItemState {
                     memory: MemoryState {
-                        stability: 3.9653313,
-                        difficulty: 9.7949
+                        stability: 2.969144,
+                        difficulty: 9.520562
                     },
-                    interval: 4
+                    interval: 3
                 },
                 hard: ItemState {
                     memory: MemoryState {
-                        stability: 22.415548,
-                        difficulty: 8.7779
+                        stability: 17.091442,
+                        difficulty: 8.4513445
                     },
-                    interval: 22
+                    interval: 17
                 },
                 good: ItemState {
                     memory: MemoryState {
-                        stability: 43.05542,
-                        difficulty: 7.7609
+                        stability: 31.722975,
+                        difficulty: 7.382128
                     },
-                    interval: 43
+                    interval: 32
                 },
                 easy: ItemState {
                     memory: MemoryState {
-                        stability: 90.86977,
-                        difficulty: 6.7439003
+                        stability: 71.75015,
+                        difficulty: 6.3129106
                     },
-                    interval: 91
+                    interval: 72
                 }
             }
         );
@@ -556,36 +578,40 @@ mod tests {
     }
 
     #[test]
-    fn states_are_unchaged_when_no_days_elapsed() -> Result<()> {
-        let fsrs = FSRS::new(Some(&[]))?;
-        // the first time a card is seen, a memory state must be set
-        let mut state_a = fsrs.next_states(None, 1.0, 0)?.again.memory;
-        // but if no days have elapsed and it's reviewed again, the state should be unchanged
-        let state_b = fsrs.next_states(Some(state_a), 1.0, 0)?.again.memory;
-        assert_eq!(state_a, state_b);
-        // if a day elapses, it's counted
-        state_a = fsrs.next_states(Some(state_a), 1.0, 1)?.again.memory;
-        assert_ne!(state_a, state_b);
-
-        Ok(())
+    fn current_retrievability() {
+        let fsrs = FSRS::new(None).unwrap();
+        let state = MemoryState {
+            stability: 1.0,
+            difficulty: 5.0,
+        };
+        assert_eq!(fsrs.current_retrievability(state, 0), 1.0);
+        assert_eq!(fsrs.current_retrievability(state, 1), 0.9);
+        assert_eq!(fsrs.current_retrievability(state, 2), 0.82502866);
+        assert_eq!(fsrs.current_retrievability(state, 3), 0.76613088);
     }
 
     #[test]
     fn memory_from_sm2() -> Result<()> {
         let fsrs = FSRS::new(Some(&[]))?;
-        assert_eq!(
-            fsrs.memory_state_from_sm2(2.5, 10.0, 0.9).unwrap(),
-            MemoryState {
-                stability: 9.999995,
-                difficulty: 7.4120417
-            }
+        let memory_state = fsrs.memory_state_from_sm2(2.5, 10.0, 0.9).unwrap();
+        assert_approx_eq(
+            [memory_state.stability, memory_state.difficulty],
+            [9.999996, 7.279789],
         );
-        assert_eq!(
-            fsrs.memory_state_from_sm2(1.3, 20.0, 0.9).unwrap(),
-            MemoryState {
-                stability: 19.99999,
-                difficulty: 10.0
-            }
+        let memory_state = fsrs.memory_state_from_sm2(2.5, 10.0, 0.8).unwrap();
+        assert_approx_eq(
+            [memory_state.stability, memory_state.difficulty],
+            [4.170096, 9.462736],
+        );
+        let memory_state = fsrs.memory_state_from_sm2(2.5, 10.0, 0.95).unwrap();
+        assert_approx_eq(
+            [memory_state.stability, memory_state.difficulty],
+            [21.712555, 2.380_21],
+        );
+        let memory_state = fsrs.memory_state_from_sm2(1.3, 20.0, 0.9).unwrap();
+        assert_approx_eq(
+            [memory_state.stability, memory_state.difficulty],
+            [19.999992, 10.0],
         );
         let interval = 15;
         let ease_factor = 2.0;
