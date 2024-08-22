@@ -12,36 +12,45 @@ static R_S0_DEFAULT_ARRAY: &[(u32, f32); 4] = &[
     (4, DEFAULT_PARAMETERS[3]),
 ];
 
-pub fn pretrain(fsrs_items: Vec<FSRSItem>, average_recall: f32) -> Result<[f32; 4]> {
+pub fn pretrain(
+    fsrs_items: Vec<FSRSItem>,
+    average_recall: f32,
+) -> Result<([f32; 4], HashMap<u32, u32>)> {
     let pretrainset = create_pretrain_data(fsrs_items);
     let rating_count = total_rating_count(&pretrainset);
     let mut rating_stability = search_parameters(pretrainset, average_recall);
-    smooth_and_fill(&mut rating_stability, &rating_count)
+    Ok((
+        smooth_and_fill(&mut rating_stability, &rating_count)?,
+        rating_count,
+    ))
 }
 
 type FirstRating = u32;
 type Count = u32;
 
 fn create_pretrain_data(fsrs_items: Vec<FSRSItem>) -> HashMap<FirstRating, Vec<AverageRecall>> {
-    // filter FSRSItem instances with exactly 2 reviews.
+    // filter FSRSItem instances with exactly 1 long term review.
     let items: Vec<_> = fsrs_items
         .into_iter()
-        .filter(|item| item.reviews.len() == 2)
+        .filter(|item| item.long_term_review_cnt() == 1)
         .collect();
 
     // use a nested HashMap (groups) to group items first by the rating in the first FSRSReview
     // and then by the delta_t in the second FSRSReview.
-    // (first_rating -> second_delta_t -> vec![0/1 for fail/pass])
+    // (first_rating -> first_long_term_delta_t -> vec![0/1 for fail/pass])
     let mut groups = HashMap::new();
 
     for item in items {
         let first_rating = item.reviews[0].rating;
-        let second_delta_t = item.reviews[1].delta_t;
-        let second_label = (item.reviews[1].rating > 1) as i32;
+        let first_long_term_review = item.first_long_term_review();
+        let first_long_term_delta_t = first_long_term_review.delta_t;
+        let first_long_term_label = (first_long_term_review.rating > 1) as i32;
 
         let inner_map = groups.entry(first_rating).or_insert_with(HashMap::new);
-        let ratings = inner_map.entry(second_delta_t).or_insert_with(Vec::new);
-        ratings.push(second_label);
+        let ratings = inner_map
+            .entry(first_long_term_delta_t)
+            .or_insert_with(Vec::new);
+        ratings.push(first_long_term_label);
     }
 
     let mut results = HashMap::new();
@@ -155,7 +164,7 @@ fn search_parameters(
     optimal_stabilities
 }
 
-fn smooth_and_fill(
+pub(crate) fn smooth_and_fill(
     rating_stability: &mut HashMap<u32, f32>,
     rating_count: &HashMap<u32, u32>,
 ) -> Result<[f32; 4]> {
@@ -293,9 +302,9 @@ mod tests {
         let count = Array1::from(vec![435.0, 97.0, 63.0, 38.0, 28.0]);
         let default_s0 = DEFAULT_PARAMETERS[0] as f64;
         let actual = loss(&delta_t, &recall, &count, 1.017056, default_s0);
-        assert_eq!(actual, 280.7447802452844);
+        assert_eq!(actual, 280.7497802442413);
         let actual = loss(&delta_t, &recall, &count, 1.017011, default_s0);
-        assert_eq!(actual, 280.7444462249327);
+        assert_eq!(actual, 280.7494462238896);
     }
 
     #[test]
@@ -331,7 +340,7 @@ mod tests {
                 },
             ],
         )]);
-        let actual = search_parameters(pretrainset, 0.9430285915990116);
+        let actual = search_parameters(pretrainset, 0.943_028_57);
         Data::from([*actual.get(&first_rating).unwrap()])
             .assert_approx_eq(&Data::from([0.908_688]), 6);
     }
@@ -340,12 +349,13 @@ mod tests {
     fn test_pretrain() {
         use crate::convertor_tests::anki21_sample_file_converted_to_fsrs;
         let items = anki21_sample_file_converted_to_fsrs();
-        let (mut pretrainset, mut trainset) =
-            items.into_iter().partition(|item| item.reviews.len() == 2);
+        let (mut pretrainset, mut trainset) = items
+            .into_iter()
+            .partition(|item| item.long_term_review_cnt() == 1);
         (pretrainset, trainset) = filter_outlier(pretrainset, trainset);
         let items = [pretrainset.clone(), trainset].concat();
         let average_recall = calculate_average_recall(&items);
-        Data::from(pretrain(pretrainset, average_recall).unwrap())
+        Data::from(pretrain(pretrainset, average_recall).unwrap().0)
             .assert_approx_eq(&Data::from([0.908_688, 1.678_973, 4.216_837, 9.615_904]), 6)
     }
 
@@ -359,6 +369,6 @@ mod tests {
         let mut rating_stability = HashMap::from([(2, 0.35)]);
         let rating_count = HashMap::from([(2, 1)]);
         let actual = smooth_and_fill(&mut rating_stability, &rating_count).unwrap();
-        assert_eq!(actual, [0.1217739, 0.35, 0.928426, 3.4544096]);
+        assert_eq!(actual, [0.12048356, 0.35, 0.9249894, 4.577961]);
     }
 }

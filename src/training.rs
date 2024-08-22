@@ -1,10 +1,10 @@
 use crate::batch_shuffle::BatchShuffledDataLoaderBuilder;
 use crate::cosine_annealing::CosineAnnealingLR;
-use crate::dataset::{split_filter_data, FSRSBatcher, FSRSDataset, FSRSItem};
+use crate::dataset::{prepare_training_data, FSRSBatcher, FSRSDataset, FSRSItem};
 use crate::error::Result;
 use crate::model::{Model, ModelConfig};
 use crate::parameter_clipper::parameter_clipper;
-use crate::pre_training::pretrain;
+use crate::pre_training::{pretrain, smooth_and_fill};
 use crate::{FSRSError, DEFAULT_PARAMETERS, FSRS};
 use burn::backend::Autodiff;
 
@@ -207,28 +207,29 @@ impl<B: Backend> FSRS<B> {
         };
 
         let average_recall = calculate_average_recall(&train_set);
-        let (pre_train_set, next_train_set) = split_filter_data(train_set);
-        if pre_train_set.len() + next_train_set.len() < 8 {
+        let (pre_train_set, train_set) = prepare_training_data(train_set);
+        if train_set.len() < 8 {
             finish_progress();
             return Ok(DEFAULT_PARAMETERS.to_vec());
         }
 
-        let initial_stability = pretrain(pre_train_set.clone(), average_recall).map_err(|e| {
-            finish_progress();
-            e
-        })?;
+        let (initial_stability, initial_rating_count) =
+            pretrain(pre_train_set.clone(), average_recall).map_err(|e| {
+                finish_progress();
+                e
+            })?;
         let pretrained_parameters: Vec<f32> = initial_stability
             .into_iter()
             .chain(DEFAULT_PARAMETERS[4..].iter().copied())
             .collect();
-        if next_train_set.is_empty() || pre_train_set.len() + next_train_set.len() < 64 {
+        if train_set.len() == pre_train_set.len() || train_set.len() < 64 {
             finish_progress();
             return Ok(pretrained_parameters);
         }
 
         let config = TrainingConfig::new(
             ModelConfig {
-                freeze_stability: true,
+                freeze_stability: false,
                 initial_stability: Some(initial_stability),
             },
             AdamConfig::new(),
@@ -237,7 +238,7 @@ impl<B: Backend> FSRS<B> {
         if let Some(progress) = &progress {
             let progress_state = ProgressState {
                 epoch_total: config.num_epochs,
-                items_total: next_train_set.len(),
+                items_total: train_set.len(),
                 epoch: 0,
                 items_processed: 0,
             };
@@ -245,8 +246,8 @@ impl<B: Backend> FSRS<B> {
         }
 
         let model = train::<Autodiff<B>>(
-            next_train_set.clone(),
-            next_train_set,
+            train_set.clone(),
+            train_set,
             &config,
             self.device(),
             progress.clone().map(|p| ProgressCollector::new(p, 0)),
@@ -272,29 +273,37 @@ impl<B: Backend> FSRS<B> {
             return Err(FSRSError::InvalidInput);
         }
 
+        let mut optimized_initial_stability = optimized_parameters[0..4]
+            .iter()
+            .enumerate()
+            .map(|(i, &val)| (i as u32 + 1, val))
+            .collect();
+        let clamped_stability =
+            smooth_and_fill(&mut optimized_initial_stability, &initial_rating_count).unwrap();
+        let optimized_parameters = clamped_stability
+            .into_iter()
+            .chain(optimized_parameters[4..].iter().copied())
+            .collect();
+
         Ok(optimized_parameters)
     }
 
     pub fn benchmark(&self, train_set: Vec<FSRSItem>) -> Vec<f32> {
         let average_recall = calculate_average_recall(&train_set);
-        let (pre_train_set, next_train_set) = train_set
+        let (pre_train_set, _next_train_set) = train_set
+            .clone()
             .into_iter()
-            .partition(|item| item.reviews.len() == 2);
-        let initial_stability = pretrain(pre_train_set, average_recall).unwrap();
+            .partition(|item| item.long_term_review_cnt() == 1);
+        let initial_stability = pretrain(pre_train_set, average_recall).unwrap().0;
         let config = TrainingConfig::new(
             ModelConfig {
-                freeze_stability: true,
+                freeze_stability: false,
                 initial_stability: Some(initial_stability),
             },
             AdamConfig::new(),
         );
-        let model = train::<Autodiff<B>>(
-            next_train_set.clone(),
-            next_train_set,
-            &config,
-            self.device(),
-            None,
-        );
+        let model =
+            train::<Autodiff<B>>(train_set.clone(), train_set, &config, self.device(), None);
         let parameters: Vec<f32> = model.unwrap().w.val().to_data().convert().value;
         parameters
     }
@@ -336,7 +345,7 @@ fn train<B: AutodiffBackend>(
     let mut model: Model<B> = config.model.init();
     let mut optim = config.optimizer.init::<B, Model<B>>();
 
-    let mut best_loss = std::f64::INFINITY;
+    let mut best_loss = f64::INFINITY;
     let mut best_model = model.clone();
     for epoch in 1..=config.num_epochs {
         let mut iterator = dataloader_train.iter();
