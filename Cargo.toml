@@ -17,22 +17,22 @@ description = "FSRS for Rust, including Optimizer and Scheduler"
 [dependencies.burn]
 version = "0.14.0"
 git = "https://github.com/ahmedyarub/burn.git"
-rev = "cc84ddbb75f68afa502dbd6ee72e944d0c8d11ce"
+rev = "622f55b69ad42f04e05c79ac2aa81525b0425a63"
 default-features = false
 features = ["std", "train", "ndarray"]
 
 [dev-dependencies.burn]
 version = "0.14.0"
 git = "https://github.com/ahmedyarub/burn.git"
-rev = "cc84ddbb75f68afa502dbd6ee72e944d0c8d11ce"
+rev = "622f55b69ad42f04e05c79ac2aa81525b0425a63"
 default-features = false
 features = ["std", "train", "ndarray", "sqlite-bundled"]
 
 [dependencies]
 itertools = "0.13.0"
 log = "0.4.21"
-ndarray = "0.15.6"
-ndarray-rand = "0.14.0"
+ndarray = "0.16.1"
+ndarray-rand = "0.15.0"
 rand = "0.8.5"
 rayon = "1.10.0"
 serde = "1.0.201"
@@ -45,7 +45,7 @@ chrono-tz = "0.9.0"
 criterion = { version = "0.5.1" }
 csv = "1.3.0"
 fern = "0.6.0"
-rusqlite = { version = "0.31.0" }
+rusqlite = { version = "0.32.1" }
 
 [[bench]]
 name = "benchmark"
